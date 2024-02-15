@@ -6,7 +6,6 @@ dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
 
 table = dynamodb.Table('Movies')
 
-  
-  response = table.put_item(
+response = table.put_item(
     Item={
             
