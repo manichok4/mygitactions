@@ -1,0 +1,697 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+    This is the CloudFormation template to deploy resources
+    for Veeva PromoMats extraction job per each scope.
+
+Parameters:
+    Organization:
+        Type: String
+        Description: Organization name corresponding to the OPMC naming convention
+        Default: alcon
+    Product:
+        Type: String
+        Description: Product name corresponding to the OPMC naming convention
+        Default: vextract
+    Module:
+        Type: String
+        Description: Module name corresponding to the OPMC naming convention
+        Default: promomats
+    Scope:
+        Type: String
+        Description: Extraction scope name
+        Default: pilot
+    VeevaAPIEndpoint:
+        Type: String
+        Description: Domain name for Veeva API
+        Default: 'sb-alcon-global-promomats.veevavault.com'
+        MinLength: 1
+    VeevaUserId:
+        Type: String
+        Description: SSM Parameter name that stores user ID for Veeva API authentication
+        MinLength: 1
+    VeevaPassword:
+        Type: String
+        Description: SSM Parameter name that stores password for Veeva API authentication
+        MinLength: 1
+    EnvironmentName:
+        Type: String
+        Description: >-
+            Environment name (up to 4 characters) such as dev, int, stg
+            that will be used for resource name prefix (wherever applicable)
+        Default: dev
+        MinLength: 1
+        MaxLength: 4
+    TargetAWSAccountNumber:
+        Type: String
+        Description: 12-digit AWS account number for target account
+        AllowedPattern: '^(\d{12})(,\s*\d{12})*$'
+        Default: 616414764788
+    LogRetentionPeriod:
+        Type: String
+        Description: Retention period (in days) for Batch job CloudWatch Log (Leave blanks to never expire)
+        AllowedValues:
+            - ''
+            - 1
+            - 3
+            - 5
+            - 7
+            - 14
+            - 30
+            - 60
+            - 90
+            - 120
+            - 150
+            - 180
+            - 365
+            - 400
+            - 545
+            - 731
+            - 1827
+            - 3653
+    BatchComputeEnv:
+        Type: String
+        Description: AWS Batch compute environment ARN
+    JobTable:
+        Type: String
+        Description: DynamoDB table name for Job
+    DocumentTable:
+        Type: String
+        Description: DynamoDB table name for Document
+    RenditionTable:
+        Type: String
+        Description: DynamoDB Table name for Rendition
+    DocumentBucket:
+        Type: String
+        Description: S3 Bucket name for documents
+    EcsTaskExecutionRole:
+        Type: String
+        Description: ARN of Role for ECS Task Execution
+    BatchJobRoleArn:
+        Type: String
+        Description: ARN of Role for Batch Job
+    BatchJobRoleName:
+        Type: String
+        Description: Name of Role for Batch Job
+    SubmitScheduledBatchJobRole:
+        Type: String
+        Description: ARN of Role for CloudWatch Event Rule to submit job
+    ConfigureSchedule:
+        Type: String
+        Description: Indicate whether to create scheduled CloudWatch event to regularly run extraction
+        AllowedValues:
+            - 'y'
+            - 'n'
+        Default: 'y'
+    JobStatusNotificationTopic:
+        Type: String
+        Description: ARN of SNS Topic to notify job status
+    JobSummaryNotificationTopic:
+        Type: String
+        Description: ARN of SNS Topic to notify job summary
+    SnsKeyAlias:
+        Type: String
+        Description: Alias of customer-managed key for SNS encryption
+
+Conditions:
+    LogNeverExpire: !Equals
+        - !Ref LogRetentionPeriod
+        - ''
+    CreateScheduleEvent: !Equals
+        - !Ref ConfigureSchedule
+        - 'y'
+
+Resources:
+    # SNS resources
+    ExtractionNotificationTopic:
+        Type: AWS::SNS::Topic
+        Properties:
+            TopicName: !Sub '${Organization}-${Product}-${Module}-${Scope}-${EnvironmentName}'
+            KmsMasterKeyId: !Ref SnsKeyAlias
+
+    FIFOExtractionNotificationTopic:
+        Type: AWS::SNS::Topic
+        Properties:
+            TopicName: !Sub '${Organization}-${Product}-${Module}-${Scope}-${EnvironmentName}.fifo'
+            ContentBasedDeduplication: false
+            FifoTopic: true
+            KmsMasterKeyId: !Ref SnsKeyAlias
+
+    ExtractionNotificationTopicPolicy:
+        Type: AWS::SNS::TopicPolicy
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: F18
+                      reason: |
+                          Default policy for owner uses AWS:SourceOwner condition
+        Properties:
+            Topics:
+                - !Ref ExtractionNotificationTopic
+            PolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    - Action:
+                          - 'sns:GetTopicAttributes'
+                          - 'sns:SetTopicAttributes'
+                          - 'sns:AddPermission'
+                          - 'sns:RemovePermission'
+                          - 'sns:DeleteTopic'
+                          - 'sns:Subscribe'
+                          - 'sns:ListSubscriptionsByTopic'
+                          - 'sns:Publish'
+                          - 'sns:Receive'
+                          - 'sns:GetTopicAttributes'
+                          - 'sns:GetTopicAttributes'
+                      Effect: Allow
+                      Resource: !Ref ExtractionNotificationTopic
+                      Principal:
+                          AWS: '*'
+                      Condition:
+                          StringEquals:
+                              AWS:SourceOwner: !Sub '${AWS::AccountId}'
+                      Sid: 'default_access_for_topic_owner'
+
+    FIFOExtractionNotificationTopicPolicy:
+        Type: AWS::SNS::TopicPolicy
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: F18
+                      reason: |
+                          Default policy for owner uses AWS:SourceOwner condition
+        Properties:
+            Topics:
+                - !Ref FIFOExtractionNotificationTopic
+            PolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    - Action:
+                          - 'sns:GetTopicAttributes'
+                          - 'sns:SetTopicAttributes'
+                          - 'sns:AddPermission'
+                          - 'sns:RemovePermission'
+                          - 'sns:DeleteTopic'
+                          - 'sns:Subscribe'
+                          - 'sns:ListSubscriptionsByTopic'
+                          - 'sns:Publish'
+                          - 'sns:Receive'
+                          - 'sns:GetTopicAttributes'
+                          - 'sns:GetTopicAttributes'
+                      Effect: Allow
+                      Resource: !Ref FIFOExtractionNotificationTopic
+                      Principal:
+                          AWS: '*'
+                      Condition:
+                          StringEquals:
+                              AWS:SourceOwner: !Sub '${AWS::AccountId}'
+                      Sid: 'default_access_for_topic_owner'
+
+    TopicCrossAccountPolicyProcessor:
+        Type: Custom::CrossAccountPolicyProcessor
+        Properties:
+            ServiceToken: !GetAtt CrossAccountPolicyProcessorLambda.Arn
+            TargetAWSAccountNumber: !Ref TargetAWSAccountNumber
+            TopicArn: !Ref ExtractionNotificationTopic
+    FIFOTopicCrossAccountPolicyProcessor:
+        Type: Custom::CrossAccountPolicyProcessor
+        Properties:
+            ServiceToken: !GetAtt CrossAccountPolicyProcessorLambda.Arn
+            TargetAWSAccountNumber: !Ref TargetAWSAccountNumber
+            TopicArn: !Ref FIFOExtractionNotificationTopic
+    CrossAccountPolicyProcessorLambdaRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    - Effect: 'Allow'
+                      Principal:
+                          Service:
+                              - 'lambda.amazonaws.com'
+                      Action:
+                          - 'sts:AssumeRole'
+            Policies:
+                - PolicyName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-cross-account-processor-policy'
+                  PolicyDocument:
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - sns:GetTopicAttributes
+                                - sns:SetTopicAttributes
+                            Resource:
+                                - !Ref ExtractionNotificationTopic
+                                - !Ref FIFOExtractionNotificationTopic
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogGroup
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource:
+                                - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+                                - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${Organization}-${Product}-${Module}-${EnvironmentName}-cross-account-sns-policy-processor'
+                                - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${Organization}-${Product}-${Module}-${EnvironmentName}-cross-account-sns-policy-processor:*'
+
+    CrossAccountPolicyProcessorLambda:
+        Type: AWS::Lambda::Function
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: |
+                          Deploy without VPC Config as the Lambda function invokes AWS IAM APIs
+                          and does not access any resources in VPC.
+                    - id: W92
+                      reason: |
+                          The Lambda function is a CloudFormation custom resource and is only invoked
+                          when the stack is updated or delete, so not specifying ReservedConcurrentExecutions
+        Properties:
+            FunctionName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-cross-account-sns-policy-processor'
+            Role: !GetAtt CrossAccountPolicyProcessorLambdaRole.Arn
+            Runtime: python3.9
+            Handler: index.handler
+            Timeout: 300
+            Code:
+                ZipFile: |
+                    import json
+                    import cfnresponse
+                    import boto3
+                    import re
+
+                    sns_client = boto3.client('sns')
+
+                    def statement_for_account(account_no, topic_arn):
+                        return {
+                            "Sid": f"cross_account_access_for_{account_no}",
+                            "Effect": "Allow",
+                            "Action": ["sns:Subscribe"],
+                            "Resource": topic_arn,
+                            "Principal": {
+                                "AWS": f"arn:aws:iam::{account_no}:root"
+                            }
+                        }
+
+                    def update_topic_policy(topic_arn, access_policy):
+                        sns_client.set_topic_attributes(
+                            TopicArn=topic_arn,
+                            AttributeName='Policy',
+                            AttributeValue=json.dumps(access_policy))
+
+                    def get_policy_for_topic(topic_arn):
+                        r = sns_client.get_topic_attributes(TopicArn=topic_arn)
+                        if 'Attributes' in r:
+                            return json.loads(r['Attributes']['Policy'])
+
+                    def is_statement_for_acct(stmt):
+                        if (stmt['Sid'].startswith('cross_account_access_for_') and
+                                (re.match(r'^arn:aws:iam::\d{12}:root$', stmt['Principal']['AWS']))):
+                            return True
+                        else:
+                            return False
+
+                    def handler(event, context):
+                        try:
+                            topic_arn = event["ResourceProperties"]["TopicArn"]
+                            account_numbers = event["ResourceProperties"]["TargetAWSAccountNumber"].split(',')
+                            account_numbers = [acct.strip() for acct in account_numbers]
+
+                            if event['RequestType'] == 'Create':
+                                print(f'Create-{event["ResourceProperties"]["TargetAWSAccountNumber"]}')
+                                for acct_no in account_numbers:
+                                    policy = get_policy_for_topic(topic_arn)
+                                    if policy:
+                                        stmt = statement_for_account(acct_no, topic_arn)
+                                        policy['Statement'].append(stmt)
+                                        print(f'Update access policy for {acct_no}')
+                                        update_topic_policy(topic_arn, policy)
+
+                                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                            elif event['RequestType'] == 'Update':
+
+                                print(f'Update-{event["ResourceProperties"]["TargetAWSAccountNumber"]}')
+                                policy = get_policy_for_topic(topic_arn)
+                                if policy:
+                                    '''
+                                    clean-up statements for accounts that are no longer target accounts
+                                    '''
+                                    updated_stmt = [stmt for stmt in policy['Statement']
+                                                    if (is_statement_for_acct(stmt) and
+                                                        stmt['Principal']['AWS'].split(':')[4] in account_numbers) or
+                                                    (not is_statement_for_acct(stmt))]
+                                    '''
+                                    add statement for new account
+                                    '''
+                                    for acct_no in account_numbers:
+                                        stmt_for_acct = [stmt for stmt in policy['Statement']
+                                                        if (is_statement_for_acct(stmt) and
+                                                            stmt['Principal']['AWS'].split(':')[4] == acct_no)]
+                                        if len(stmt_for_acct) == 0:
+                                            updated_stmt.append(statement_for_account(acct_no, topic_arn))
+                                    policy['Statement'] = updated_stmt
+                                    update_topic_policy(topic_arn, policy)
+                                    cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                            elif event['RequestType'] == 'Delete':
+                                print(f'Delete-{event["ResourceProperties"]["TargetAWSAccountNumber"]}')
+                                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                        except Exception as e:
+                            print(f'Exception {e} is caught')
+                            cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+    # CloudWatch Log Group for Batch jobs
+    MapperBatchJobLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: |
+                          Using default CloudWatch Logs encryption
+        Properties:
+            LogGroupName: !Sub '${Organization}-${Product}-${Module}-${Scope}-${EnvironmentName}-mapper'
+            RetentionInDays: !If [LogNeverExpire, !Ref 'AWS::NoValue', !Ref LogRetentionPeriod]
+    DocExtractorBatchJobLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: |
+                          Using default CloudWatch Logs encryption
+        Properties:
+            LogGroupName: !Sub '${Organization}-${Product}-${Module}-${Scope}-${EnvironmentName}-extractor'
+            RetentionInDays: !If [LogNeverExpire, !Ref 'AWS::NoValue', !Ref LogRetentionPeriod]
+    FinisherBatchJobLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: |
+                          Using default CloudWatch Logs encryption
+        Properties:
+            LogGroupName: !Sub '${Organization}-${Product}-${Module}-${Scope}-${EnvironmentName}-finisher'
+            RetentionInDays: !If [LogNeverExpire, !Ref 'AWS::NoValue', !Ref LogRetentionPeriod]
+
+    BatchJobQueue:
+        Type: AWS::Batch::JobQueue
+        Properties:
+            ComputeEnvironmentOrder:
+                - Order: 1
+                  ComputeEnvironment: !Ref BatchComputeEnv
+            JobQueueName: !Sub '${Organization}-${Product}-${Module}-${Scope}-${EnvironmentName}-queue'
+            Priority: 1
+    MapperBatchJobDefinition:
+        Type: AWS::Batch::JobDefinition
+        Properties:
+            ContainerProperties:
+                Command:
+                    - 'run_job_mapper.py'
+                Environment:
+                    - Name: JOB_TABLE_NAME
+                      Value: !Ref JobTable
+                    - Name: RENDITION_TABLE_NAME
+                      Value: !Ref RenditionTable
+                    - Name: DOCUMENT_TABLE_NAME
+                      Value: !Ref DocumentTable
+                    - Name: VEEVA_ID_PARAM
+                      Value: !Ref VeevaUserId
+                    - Name: VEEVA_PASSWORD_PARAM
+                      Value: !Ref VeevaPassword
+                    - Name: EXTRACTION_SNS_TOPIC
+                      Value: !Ref ExtractionNotificationTopic
+                    - Name: JOB_STATUS_SNS_TOPIC
+                      Value: !Ref JobStatusNotificationTopic
+                    - Name: BUCKET_NAME
+                      Value: !Ref DocumentBucket
+                    - Name: VEEVA_API_ENDPOINT
+                      Value: !Ref VeevaAPIEndpoint
+                    - Name: EXTRACTOR_JOB_DEFN
+                      Value: !Ref DocExtractorBatchJobDefinition
+                    - Name: FINISHER_JOB_DEFN
+                      Value: !Ref JobFinisherBatchJobDefinition
+                    - Name: EXTRACTION_SCOPE_NAME
+                      Value: !Ref Scope
+                    - Name: JOB_SUMMARY_SNS_TOPIC
+                      Value: !Ref JobSummaryNotificationTopic
+                    - Name: ENVIRONMENT_NAME
+                      Value: !Ref EnvironmentName
+                ExecutionRoleArn: !Ref EcsTaskExecutionRole
+                ResourceRequirements:
+                    - Type: VCPU
+                      Value: 4
+                    - Type: MEMORY
+                      Value: 16384
+                FargatePlatformConfiguration:
+                    PlatformVersion: '1.4.0'
+                JobRoleArn: !Ref BatchJobRoleArn
+                Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Organization}-${Product}-${Module}:latest'
+                LogConfiguration:
+                    LogDriver: awslogs
+                    Options:
+                        awslogs-group: !Ref MapperBatchJobLogGroup
+            JobDefinitionName: !Sub '${Organization}-${Product}-${Module}-${Scope}-${EnvironmentName}-mapper'
+            PlatformCapabilities:
+                - FARGATE
+            Type: container
+    DocExtractorBatchJobDefinition:
+        Type: AWS::Batch::JobDefinition
+        Properties:
+            ContainerProperties:
+                Command:
+                    - 'run_doc_extractor.py'
+                Environment:
+                    - Name: JOB_TABLE_NAME
+                      Value: !Ref JobTable
+                    - Name: RENDITION_TABLE_NAME
+                      Value: !Ref RenditionTable
+                    - Name: DOCUMENT_TABLE_NAME
+                      Value: !Ref DocumentTable
+                    - Name: VEEVA_ID_PARAM
+                      Value: !Ref VeevaUserId
+                    - Name: VEEVA_PASSWORD_PARAM
+                      Value: !Ref VeevaPassword
+                    - Name: EXTRACTION_SNS_TOPIC
+                      Value: !Ref ExtractionNotificationTopic
+                    - Name: JOB_STATUS_SNS_TOPIC
+                      Value: !Ref JobStatusNotificationTopic
+                    - Name: BUCKET_NAME
+                      Value: !Ref DocumentBucket
+                    - Name: VEEVA_API_ENDPOINT
+                      Value: !Ref VeevaAPIEndpoint
+                    - Name: EXTRACTION_SCOPE_NAME
+                      Value: !Ref Scope
+                    - Name: JOB_SUMMARY_SNS_TOPIC
+                      Value: !Ref JobSummaryNotificationTopic
+                    - Name: ENVIRONMENT_NAME
+                      Value: !Ref EnvironmentName
+                ExecutionRoleArn: !Ref EcsTaskExecutionRole
+                ResourceRequirements:
+                    - Type: VCPU
+                      Value: 4
+                    - Type: MEMORY
+                      Value: 16384
+                FargatePlatformConfiguration:
+                    PlatformVersion: '1.4.0'
+                JobRoleArn: !Ref BatchJobRoleArn
+                Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Organization}-${Product}-${Module}:latest'
+                LogConfiguration:
+                    LogDriver: awslogs
+                    Options:
+                        awslogs-group: !Ref DocExtractorBatchJobLogGroup
+            JobDefinitionName: !Sub '${Organization}-${Product}-${Module}-${Scope}-${EnvironmentName}-extractor'
+            PlatformCapabilities:
+                - FARGATE
+            Type: container
+    JobFinisherBatchJobDefinition:
+        Type: AWS::Batch::JobDefinition
+        Properties:
+            ContainerProperties:
+                Command:
+                    - 'run_job_finisher.py'
+                Environment:
+                    - Name: JOB_TABLE_NAME
+                      Value: !Ref JobTable
+                    - Name: RENDITION_TABLE_NAME
+                      Value: !Ref RenditionTable
+                    - Name: DOCUMENT_TABLE_NAME
+                      Value: !Ref DocumentTable
+                    - Name: VEEVA_ID_PARAM
+                      Value: !Ref VeevaUserId
+                    - Name: VEEVA_PASSWORD_PARAM
+                      Value: !Ref VeevaPassword
+                    - Name: EXTRACTION_SNS_TOPIC
+                      Value: !Ref ExtractionNotificationTopic
+                    - Name: JOB_STATUS_SNS_TOPIC
+                      Value: !Ref JobStatusNotificationTopic
+                    - Name: BUCKET_NAME
+                      Value: !Ref DocumentBucket
+                    - Name: VEEVA_API_ENDPOINT
+                      Value: !Ref VeevaAPIEndpoint
+                    - Name: EXTRACTION_SCOPE_NAME
+                      Value: !Ref Scope
+                    - Name: JOB_SUMMARY_SNS_TOPIC
+                      Value: !Ref JobSummaryNotificationTopic
+                    - Name: ENVIRONMENT_NAME
+                      Value: !Ref EnvironmentName
+                ExecutionRoleArn: !Ref EcsTaskExecutionRole
+                ResourceRequirements:
+                    - Type: VCPU
+                      Value: 4
+                    - Type: MEMORY
+                      Value: 16384
+                FargatePlatformConfiguration:
+                    PlatformVersion: '1.4.0'
+                JobRoleArn: !Ref BatchJobRoleArn
+                Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Organization}-${Product}-${Module}:latest'
+                LogConfiguration:
+                    LogDriver: awslogs
+                    Options:
+                        awslogs-group: !Ref FinisherBatchJobLogGroup
+            JobDefinitionName: !Sub '${Organization}-${Product}-${Module}-${Scope}-${EnvironmentName}-finisher'
+            PlatformCapabilities:
+                - FARGATE
+            Type: container
+    BatchTaskPolicy:
+        Type: AWS::IAM::Policy
+        Properties:
+            Roles:
+                - !Ref BatchJobRoleName
+            PolicyName: !Sub '${Organization}-${Product}-${Module}-${Scope}-${EnvironmentName}-batch-task-policy'
+            PolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    - Effect: Allow
+                      Action:
+                          - sns:Publish
+                      Resource:
+                          - !Ref ExtractionNotificationTopic
+                          - !Ref FIFOExtractionNotificationTopic
+                    - Effect: Allow
+                      Action:
+                          - batch:SubmitJob
+                      Resource:
+                          - !Sub 'arn:aws:batch:${AWS::Region}:${AWS::AccountId}:job-definition/${Organization}-${Product}-${Module}-${Scope}*'
+                          - !Ref BatchJobQueue
+
+    # CWE resource
+    ScheduledRule:
+        Type: AWS::Events::Rule
+        Condition: CreateScheduleEvent
+        Properties:
+            Name: !Sub '${Organization}-${Product}-${Module}-${Scope}-${EnvironmentName}-scheduled-rule'
+            Description: !Sub 'Daily triggers for ${Organization}-${Product}-${Module}-${Scope}-${EnvironmentName} batch job'
+            ScheduleExpression: 'cron(0 3 * * ? *)'
+            State: 'DISABLED'
+            Targets:
+                - Arn: !Ref BatchJobQueue
+                  Id: 'TargetJobQueueV1'
+                  BatchParameters:
+                      JobDefinition: !Ref MapperBatchJobDefinition
+                      JobName: !Sub '${Organization}-${Product}-${Module}-${Scope}-${EnvironmentName}-mapper'
+                  RoleArn: !Ref SubmitScheduledBatchJobRole
+
+    # CloudWatch Event rules and related resources for Job Error Notification
+    FormatCloudWatchEventLambdaRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    - Effect: 'Allow'
+                      Principal:
+                          Service:
+                              - 'lambda.amazonaws.com'
+                      Action:
+                          - 'sts:AssumeRole'
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+            Policies:
+                - PolicyName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-sns-publish-policy'
+                  PolicyDocument:
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - sns:Publish
+                            Resource:
+                                - !Ref JobStatusNotificationTopic
+
+    FormatCloudWatchEventLambda:
+        Type: 'AWS::Lambda::Function'
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: |
+                          Deploy without VPC Config as the Lambda function invokes AWS SNS APIs
+                          and does not access any resources in VPC.
+                    - id: W92
+                      reason: |
+                          The Lambda function is triggered when batch job status changed
+                          so not specifying ReservedConcurrentExecutions
+        Properties:
+            Code:
+                ZipFile: |
+                    import boto3, json, os
+                    SNS_TOPIC_ARN = os.environ['sns_topic_arn']
+                    def lambda_handler(event, context):
+                        account_id = event['account']
+                        job_id = event['detail']['jobId']
+                        job_name = event['detail']['jobName']
+                        job_status = event['detail']['status']
+                        job_queue = event['detail']['jobQueue']
+                        job_definition = event['detail']['jobDefinition']
+                        raw_message = event
+                        client = boto3.client('sns')
+                        response = client.publish(
+                            TopicArn=SNS_TOPIC_ARN,
+                            Subject= f"FAILED AWS Batch Job in AWS account {account_id}",
+                            Message= f"""
+                            ==========================================================================
+                            Account ID: {account_id} \n
+                            Job ID: {job_id} \n
+                            Job Name {job_name} \n
+                            Job Queue: {job_queue} \n
+                            Job Definition: {job_definition} \n
+                            Job Status: {job_status}
+                            ==========================================================================
+                            \n Raw Message: \n
+                            {raw_message}
+                            """
+                        )
+            FunctionName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-notify-job-status'
+            Description: Function to process SNS notifications sent by AWS Batch
+            Handler: index.lambda_handler
+            Role: !GetAtt FormatCloudWatchEventLambdaRole.Arn
+            Runtime: python3.9
+            Environment:
+                Variables:
+                    sns_topic_arn: !Ref JobStatusNotificationTopic
+            Timeout: 300
+
+    LambdaPermissionForCloudWatchEvent:
+        Type: AWS::Lambda::Permission
+        Properties:
+            Action: lambda:InvokeFunction
+            FunctionName: !GetAtt FormatCloudWatchEventLambda.Arn
+            Principal: events.amazonaws.com
+
+    BatchJobStatusErrorEventRule:
+        Type: AWS::Events::Rule
+        Properties:
+            Description: 'AWS Batch Job Status Change to Error'
+            EventPattern:
+                source:
+                    - aws.batch
+                detail-type:
+                    - 'Batch Job State Change'
+                detail:
+                    status:
+                        - 'FAILED'
+                    jobDefinition:
+                        - !Ref MapperBatchJobDefinition
+                        - !Ref DocExtractorBatchJobDefinition
+                        - !Ref JobFinisherBatchJobDefinition
+            State: ENABLED
+            Targets:
+                - Arn: !GetAtt FormatCloudWatchEventLambda.Arn
+                  Id: TargetFunctionV1

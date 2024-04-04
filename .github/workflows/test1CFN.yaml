@@ -1,0 +1,741 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+    This is the main CloudFormation template to deploy core resources
+    for Veeva PromoMats extraction job.
+
+Metadata:
+    AWS::CloudFormation::Interface:
+        ParameterGroups:
+            - Label:
+                  default: OPMC details
+              Parameters:
+                  - Organization
+                  - Product
+                  - Module
+            - Label:
+                  default: Veeva PromoMats connection
+              Parameters:
+                  - VeevaAPIEndpoint
+                  - VeevaUserId
+                  - VeevaPassword
+            - Label:
+                  default: Key Administrator
+              Parameters:
+                  - KeyAdministratorRoleName
+            - Label:
+                  default: Deployment environment
+              Parameters:
+                  - EnvironmentName
+            - Label:
+                  default: Cross-account access
+              Parameters:
+                  - TargetAWSAccountNumber
+            - Label:
+                  default: CloudWatch Log configuration
+              Parameters:
+                  - LogRetentionPeriod
+            - Label:
+                  default: Network configuration
+              Parameters:
+                  - VpcId
+                  - SubnetIds
+
+Parameters:
+    Organization:
+        Type: String
+        Description: Organization name corresponding to the OPMC naming convention
+        Default: alcon
+    Product:
+        Type: String
+        Description: Product name corresponding to the OPMC naming convention
+        Default: vextract
+    Module:
+        Type: String
+        Description: Module name corresponding to the OPMC naming convention
+        Default: promomats
+    VeevaAPIEndpoint:
+        Type: String
+        Description: Domain name for Veeva API
+        Default: 'sb-alcon-global-promomats.veevavault.com'
+        MinLength: 1
+    VeevaUserId:
+        Type: String
+        Description: SSM Parameter name that stores user ID for Veeva API authentication
+        MinLength: 1
+    VeevaPassword:
+        Type: String
+        Description: SSM Parameter name that stores password for Veeva API authentication
+        MinLength: 1
+    EnvironmentName:
+        Type: String
+        Description: >-
+            Environment name (up to 4 characters) such as dev, int, stg that will be used
+            for resource name prefix (wherever applicable)
+        Default: dev
+        MinLength: 1
+        MaxLength: 4
+    TargetAWSAccountNumber:
+        Type: String
+        Description: 12-digit AWS account number for target account
+        AllowedPattern: '^(\d{12})(,\s*\d{12})*$'
+        Default: 616414764788
+    VpcId:
+        Type: AWS::EC2::VPC::Id
+        Description: VPC ID for AWS Batch Compute Environment
+    SubnetIds:
+        Type: List<AWS::EC2::Subnet::Id>
+        Description: List of Subnet IDs for AWS Batch Compute Environment
+    KeyAdministratorRoleName:
+        Type: String
+        Description: IAM role name for KMS key administration
+        MinLength: 1
+        Default: Acct1Admin
+    LogRetentionPeriod:
+        Type: String
+        Description: Retention period (in days) for Batch job CloudWatch Log (Leave blanks to never expire)
+        AllowedValues:
+            - ''
+            - 1
+            - 3
+            - 5
+            - 7
+            - 14
+            - 30
+            - 60
+            - 90
+            - 120
+            - 150
+            - 180
+            - 365
+            - 400
+            - 545
+            - 731
+            - 1827
+            - 3653
+
+Resources:
+    # DynamoDB resources
+    JobTable:
+        Type: AWS::DynamoDB::Table
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W74
+                      reason: |
+                          Using default encryption by DynamoDB
+        Properties:
+            BillingMode: PAY_PER_REQUEST
+            # TableName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-job'
+            AttributeDefinitions:
+                - AttributeName: 'id'
+                  AttributeType: 'S'
+                - AttributeName: 'source'
+                  AttributeType: 'S'
+                - AttributeName: 'runDate'
+                  AttributeType: 'S'
+                - AttributeName: 'status#RunDate'
+                  AttributeType: 'S'
+                - AttributeName: 'scope#RunDate'
+                  AttributeType: 'S'
+                - AttributeName: 'scope#Status#RunDate'
+                  AttributeType: 'S'
+            KeySchema:
+                - AttributeName: 'id'
+                  KeyType: 'HASH'
+            PointInTimeRecoverySpecification:
+                PointInTimeRecoveryEnabled: true
+            GlobalSecondaryIndexes:
+                - IndexName: 'bySourceByStatusByRunDate'
+                  KeySchema:
+                      - AttributeName: 'source'
+                        KeyType: 'HASH'
+                      - AttributeName: 'status#RunDate'
+                        KeyType: 'RANGE'
+                  Projection:
+                      ProjectionType: ALL
+                - IndexName: 'bySourceByRunDate'
+                  KeySchema:
+                      - AttributeName: 'source'
+                        KeyType: 'HASH'
+                      - AttributeName: 'runDate'
+                        KeyType: 'RANGE'
+                  Projection:
+                      ProjectionType: ALL
+                - IndexName: 'bySourceByScopeByRunDate'
+                  KeySchema:
+                      - AttributeName: 'source'
+                        KeyType: 'HASH'
+                      - AttributeName: 'scope#RunDate'
+                        KeyType: 'RANGE'
+                  Projection:
+                      ProjectionType: ALL
+                - IndexName: 'bySourceByScopeByStatusByRunDate'
+                  KeySchema:
+                      - AttributeName: 'source'
+                        KeyType: 'HASH'
+                      - AttributeName: 'scope#Status#RunDate'
+                        KeyType: 'RANGE'
+                  Projection:
+                      ProjectionType: ALL
+    DocumentTable:
+        Type: AWS::DynamoDB::Table
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W74
+                      reason: |
+                          Using default encryption by DynamoDB
+        Properties:
+            BillingMode: PAY_PER_REQUEST
+            # TableName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-document'
+            AttributeDefinitions:
+                - AttributeName: 'jobID'
+                  AttributeType: 'S'
+                - AttributeName: 'documentID#version'
+                  AttributeType: 'S'
+                - AttributeName: 'sequenceNo'
+                  AttributeType: 'S'
+                - AttributeName: 'status#SequenceNo'
+                  AttributeType: 'S'
+            KeySchema:
+                - AttributeName: 'jobID'
+                  KeyType: 'HASH'
+                - AttributeName: 'documentID#version'
+                  KeyType: 'RANGE'
+            PointInTimeRecoverySpecification:
+                PointInTimeRecoveryEnabled: true
+            GlobalSecondaryIndexes:
+                - IndexName: 'byJobIdBySeqNo'
+                  KeySchema:
+                      - AttributeName: 'jobID'
+                        KeyType: 'HASH'
+                      - AttributeName: 'sequenceNo'
+                        KeyType: 'RANGE'
+                  Projection:
+                      ProjectionType: ALL
+                - IndexName: 'byJobIdByStatusBySeqNo'
+                  KeySchema:
+                      - AttributeName: 'jobID'
+                        KeyType: 'HASH'
+                      - AttributeName: 'status#SequenceNo'
+                        KeyType: 'RANGE'
+                  Projection:
+                      ProjectionType: ALL
+
+    RenditionTable:
+        Type: AWS::DynamoDB::Table
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W74
+                      reason: |
+                          Using default encryption by DynamoDB
+        Properties:
+            BillingMode: PAY_PER_REQUEST
+            # TableName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-rendition'
+            AttributeDefinitions:
+                - AttributeName: 'jobID'
+                  AttributeType: 'S'
+                - AttributeName: 'documentID#version#renditionType'
+                  AttributeType: 'S'
+            KeySchema:
+                - AttributeName: 'jobID'
+                  KeyType: 'HASH'
+                - AttributeName: 'documentID#version#renditionType'
+                  KeyType: 'RANGE'
+            PointInTimeRecoverySpecification:
+                PointInTimeRecoveryEnabled: true
+    # S3 resources
+    DocumentBucket:
+        Type: AWS::S3::Bucket
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W35
+                      reason: |
+                          Using CloudTrail data events instead of S3 access log
+        Properties:
+            BucketName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-${AWS::AccountId}'
+            PublicAccessBlockConfiguration:
+                BlockPublicAcls: true
+                BlockPublicPolicy: true
+                IgnorePublicAcls: true
+                RestrictPublicBuckets: true
+            BucketEncryption:
+                ServerSideEncryptionConfiguration:
+                    - ServerSideEncryptionByDefault:
+                          SSEAlgorithm: AES256
+    DocumentBucketPolicy:
+        Type: AWS::S3::BucketPolicy
+        Properties:
+            Bucket: !Ref DocumentBucket
+            PolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    - Effect: Deny
+                      Action:
+                          - s3:*
+                      Resource:
+                          - !Sub 'arn:aws:s3:::${DocumentBucket}/*'
+                          - !Sub 'arn:aws:s3:::${DocumentBucket}'
+                      Condition:
+                          Bool:
+                              aws:SecureTransport: false
+                      Principal: '*'
+
+    # IAM resources
+    EcsTaskExecutionRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    - Effect: 'Allow'
+                      Principal:
+                          Service:
+                              - 'ecs-tasks.amazonaws.com'
+                      Action:
+                          - 'sts:AssumeRole'
+            ManagedPolicyArns:
+                - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+    BatchJobRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W11
+                      reason: |
+                          batch:ListJobs and batch:DescribeJobs requires '*' as resource
+                          https://docs.aws.amazon.com/service-authorization/latest/reference/list_awsbatch.html.
+                          Key policy to allow SNS publish with CMK uses '*' as resource
+                          https://aws.amazon.com/blogs/compute/encrypting-messages-published-to-amazon-sns-with-aws-kms/
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    - Effect: 'Allow'
+                      Principal:
+                          Service:
+                              - 'ecs-tasks.amazonaws.com'
+                      Action:
+                          - 'sts:AssumeRole'
+            Policies:
+                - PolicyName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-batch-task-policy'
+                  PolicyDocument:
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - batch:DescribeJobs
+                            Resource: '*'
+                          - Effect: Allow
+                            Action:
+                                - s3:PutObject
+                                - s3:GetObject
+                                - s3:GetObjectVersionAcl
+                                - s3:GetObjectVersion
+                                - sns:Publish
+                                - s3:AbortMultipartUpload
+                                - dynamodb:PutItem
+                                - dynamodb:GetItem
+                                - dynamodb:Query
+                            Resource:
+                                - !Sub 'arn:aws:s3:::${DocumentBucket}/*'
+                                - !GetAtt JobTable.Arn
+                                - !GetAtt DocumentTable.Arn
+                                - !GetAtt RenditionTable.Arn
+                          - Effect: Allow
+                            Action:
+                                - s3:ListBucket
+                                - dynamodb:Query
+                            Resource:
+                                - 'arn:aws:s3:::*'
+                                - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${JobTable}/index/*'
+                                - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DocumentTable}/index/*'
+                                - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${RenditionTable}/index/*'
+                          - Effect: Allow
+                            Action:
+                                - ssm:GetParameter
+                            Resource:
+                                - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${Organization}-${Product}-${Module}*'
+                          - Effect: Allow
+                            Action:
+                                - sns:Publish
+                            Resource:
+                                - !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${Organization}-${Product}-${Module}-${EnvironmentName}-job-summary'
+                          - Effect: Allow
+                            Action:
+                                - 'kms:Decrypt'
+                                - 'kms:GenerateDataKey'
+                            Resource: '*'
+                            Condition:
+                                ForAnyValue:StringEquals:
+                                    kms:ResourceAliases: !Sub 'alias/${Organization}-${Product}-${Module}-${EnvironmentName}-sns-key'
+
+    CrossAccountRoleProcessor:
+        Type: Custom::CrossAccountRoleProcessor
+        Properties:
+            ServiceToken: !GetAtt CrossAccountRoleProcessorLambda.Arn
+            Organization: !Ref Organization
+            Product: !Ref Product
+            Module: !Ref Module
+            TargetAWSAccountNumber: !Ref TargetAWSAccountNumber
+            S3AccessPolicyArn: !Ref CrossAccountS3AccessPolicy
+            EnvironmentName: !Ref EnvironmentName
+
+    CrossAccountRoleProcessorLambdaRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W11
+                      reason: |
+                          iam:ListRoles requires '*' as resource
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    - Effect: 'Allow'
+                      Principal:
+                          Service:
+                              - 'lambda.amazonaws.com'
+                      Action:
+                          - 'sts:AssumeRole'
+            Policies:
+                - PolicyName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-cross-account-processor-policy'
+                  PolicyDocument:
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - iam:ListRoles
+                            Resource:
+                                - '*'
+                          - Effect: Allow
+                            Action:
+                                - iam:CreateRole
+                                - iam:UpdateRole
+                                - iam:DeleteRole
+                                - iam:AttachRolePolicy
+                                - iam:DetachRolePolicy
+                                - iam:ListRoles
+                            Resource:
+                                - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${Organization}-${Product}-${Module}-${EnvironmentName}-*-s3-access-role'
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogGroup
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource:
+                                - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+                                - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${Organization}-${Product}-${Module}-${EnvironmentName}-cross-account-role-processor'
+                                - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${Organization}-${Product}-${Module}-${EnvironmentName}-cross-account-role-processor:*'
+    CrossAccountRoleProcessorLambda:
+        Type: AWS::Lambda::Function
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: |
+                          Deploy without VPC Config as the Lambda function invokes AWS IAM APIs
+                          and does not access any resources in VPC.
+                    - id: W92
+                      reason: |
+                          The Lambda function is a CloudFormation custom resource and is only invoked
+                          when the stack is updated or delete, so not specifying ReservedConcurrentExecutions
+        Properties:
+            FunctionName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-cross-account-role-processor'
+            Role: !GetAtt CrossAccountRoleProcessorLambdaRole.Arn
+            Runtime: python3.9
+            Handler: index.handler
+            Timeout: 300
+            Code:
+                ZipFile: |
+                    import json
+                    import cfnresponse
+                    import boto3
+                    import re
+
+                    iam_client = boto3.client('iam')
+
+                    def create_role_for_account(org, product, module, policy_arn, account_no, env):
+
+                        role_name = f'{org}-{product}-{module}-{env}-{account_no}-s3-access-role'
+                        print(f'Creating role {role_name}')
+                        assume_role_policy = {
+                            "Version": "2012-10-17",
+                            "Statement": [
+                                {
+                                    "Effect": "Allow",
+                                    "Action": "sts:AssumeRole",
+                                    "Principal": {
+                                        "AWS": f'arn:aws:iam::{account_no}:root'
+                                    }
+                                }
+                            ]
+                        }
+                        try:
+                            r = iam_client.create_role(RoleName=role_name, AssumeRolePolicyDocument=json.dumps(assume_role_policy))
+                            if 'Role' in r:
+                                print(f'Attach role policy {role_name}')
+                                iam_client.attach_role_policy(
+                                    PolicyArn=policy_arn,
+                                    RoleName=role_name)
+                            else:
+                                raise Exception(f'Failed to create role {role_name}')
+                        except iam_client.exceptions.EntityAlreadyExistsException as e:
+                            print(f'{e}')
+
+                    def handler(event, context):
+                        try:
+                            policy_arn = event["ResourceProperties"]["S3AccessPolicyArn"]
+                            org = event["ResourceProperties"]["Organization"]
+                            product = event["ResourceProperties"]["Product"]
+                            module = event["ResourceProperties"]["Module"]
+                            env = event["ResourceProperties"]["EnvironmentName"]
+                            account_numbers = event["ResourceProperties"]["TargetAWSAccountNumber"].split(',')
+                            account_numbers = [acct.strip() for acct in account_numbers]
+
+                            if event['RequestType'] == 'Create':
+                                print(f'Create-{event["ResourceProperties"]["TargetAWSAccountNumber"]}')
+                                for acct_no in account_numbers:
+                                    create_role_for_account(org, product, module, policy_arn, acct_no, env)
+
+                                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                            elif event['RequestType'] == 'Update':
+                                existing_roles = []
+                                print(f'Update-{event["ResourceProperties"]["TargetAWSAccountNumber"]}')
+                                paginator = iam_client.get_paginator('list_roles')
+                                page_iter = paginator.paginate()
+                                regex_pattern = f'^{org}-{product}-{module}-{env}-' + '\\d{12}-s3-access-role$'
+                                for page in page_iter:
+                                    roles = page['Roles']
+                                    existing_roles.extend([role for role in roles if re.match(
+                                        regex_pattern, role['RoleName'])])
+
+                                for role in existing_roles:
+                                    role_acct = role['RoleName'].split('-')[4]
+                                    if role_acct not in account_numbers:
+                                        print(f'Detaching policy from role {role["RoleName"]}')
+                                        iam_client.detach_role_policy(RoleName=role["RoleName"], PolicyArn=policy_arn)
+                                        print(f'Deleting role {role["RoleName"]}')
+                                        iam_client.delete_role(RoleName=role['RoleName'])
+
+                                for acct_no in account_numbers:
+                                    role_for_account = [role for role in existing_roles
+                                                        if role['RoleName'] == f'{org}-{product}-{module}-{env}-{acct_no}-s3-access-role']
+                                    role_exist = len(role_for_account) > 0
+                                    print(f'{acct_no} - {role_exist}')
+                                    if not role_exist:
+                                        create_role_for_account(org, product, module, policy_arn, acct_no, env)
+                                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                            elif event['RequestType'] == 'Delete':
+                                print(f'Delete-{event["ResourceProperties"]["TargetAWSAccountNumber"]}')
+                                for acct_no in account_numbers:
+                                    try:
+                                        role_name = f'{org}-{product}-{module}-{env}-{acct_no}-s3-access-role'
+                                        print(f'Detaching policy from role {role_name}')
+                                        iam_client.detach_role_policy(RoleName=role_name, PolicyArn=policy_arn)
+                                        print(f'Deleting role {role_name}')
+                                        iam_client.delete_role(RoleName=role_name)
+                                    except iam_client.exceptions.NoSuchEntityException as nsee:
+                                        print(f'{nsee}')
+                                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                        except Exception as e:
+                            print(f'Exception {e} is caught')
+                            cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+    CrossAccountS3AccessPolicy:
+        Type: AWS::IAM::ManagedPolicy
+        Properties:
+            Path: /
+            # ManagedPolicyName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-s3-cross-account-policy'
+            PolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    - Effect: Allow
+                      Action:
+                          - s3:GetObject
+                          - s3:ListBucket
+                      Resource:
+                          - !Sub 'arn:aws:s3:::${DocumentBucket}/*'
+                          - !Sub 'arn:aws:s3:::${DocumentBucket}'
+    # SNS and related resources
+    SnsCmkKey:
+        Type: AWS::KMS::Key
+        Properties:
+            Description: !Sub 'SNS Topic Encryption Key for ${Organization}-${Product}-${Module}-${EnvironmentName}'
+            EnableKeyRotation: true
+            KeyPolicy:
+                Version: 2012-10-17
+                Id: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-key-policy'
+                Statement:
+                    - Sid: 'Enable IAM User Permissions'
+                      Effect: Allow
+                      Principal:
+                          AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+                      Action: 'kms:*'
+                      Resource: '*'
+                    - Sid: 'Allow access for Key Administrators'
+                      Effect: Allow
+                      Principal:
+                          AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${KeyAdministratorRoleName}'
+                      Action:
+                          - 'kms:Create*'
+                          - 'kms:Describe*'
+                          - 'kms:Enable*'
+                          - 'kms:List*'
+                          - 'kms:Put*'
+                          - 'kms:Update*'
+                          - 'kms:Revoke*'
+                          - 'kms:Disable*'
+                          - 'kms:Get*'
+                          - 'kms:Delete*'
+                          - 'kms:TagResource'
+                          - 'kms:UntagResource'
+                          - 'kms:ScheduleKeyDeletion'
+                          - 'kms:CancelKeyDeletion'
+                      Resource: '*'
+                    - Sid: 'Allow Amazon SNS to use this key'
+                      Effect: Allow
+                      Principal:
+                          Service: 'sns.amazonaws.com'
+                      Action:
+                          - 'kms:Decrypt'
+                          - 'kms:GenerateDataKey'
+                      Resource: '*'
+                    - Sid: 'Allow Batch Job to use this key'
+                      Effect: Allow
+                      Principal:
+                          AWS: !GetAtt BatchJobRole.Arn
+                      Action:
+                          - 'kms:Decrypt'
+                          - 'kms:GenerateDataKey'
+                      Resource: '*'
+
+    SnsCmkKeyAlias:
+        Type: AWS::KMS::Alias
+        Properties:
+            AliasName: !Sub 'alias/${Organization}-${Product}-${Module}-${EnvironmentName}-sns-key'
+            TargetKeyId: !GetAtt SnsCmkKey.Arn
+
+    JobStatusNotificationTopic:
+        Type: AWS::SNS::Topic
+        Properties:
+            TopicName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-job-status'
+            DisplayName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-job-status'
+            KmsMasterKeyId: !Ref SnsCmkKeyAlias
+    JobSummaryNotificationTopic:
+        Type: AWS::SNS::Topic
+        Properties:
+            TopicName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-job-summary'
+            DisplayName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-job-summary'
+            KmsMasterKeyId: !Ref SnsCmkKeyAlias
+
+    # AWS Batch resources
+    BatchComputeSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W42
+                      reason: |
+                          Allow all ingress traffic from itself
+                    - id: W5
+                      reason: |
+                          Allow all outbound traffic to access AWS API endpoints and Veeva Vault API
+                    - id: W40
+                      reason: |
+                          Allow all outbound traffic to access AWS API endpoints and Veeva Vault API
+        Properties:
+            GroupDescription: !Sub 'Security group for ${Organization}-${Product}-${Module}-${EnvironmentName} Batch Compute Environment'
+            VpcId: !Ref VpcId
+            SecurityGroupEgress:
+                - IpProtocol: -1
+                  CidrIp: '0.0.0.0/0'
+                  FromPort: -1
+                  ToPort: -1
+                  Description: 'Allow all outbound traffic'
+            Tags:
+                - Key: Name
+                  Value: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-security-group'
+    BatchComputeSecurityGroupIngressRule:
+        Type: AWS::EC2::SecurityGroupIngress
+        Properties:
+            GroupId: !Ref BatchComputeSecurityGroup
+            IpProtocol: -1
+            FromPort: -1
+            ToPort: -1
+            SourceSecurityGroupId: !Ref BatchComputeSecurityGroup
+            Description: 'Allow all traffic from itself'
+
+    BatchComputeEnv:
+        Type: AWS::Batch::ComputeEnvironment
+        Properties:
+            ComputeEnvironmentName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-compute-env'
+            ComputeResources:
+                Type: FARGATE
+                SecurityGroupIds:
+                    - !Ref BatchComputeSecurityGroup
+                Subnets: !Ref SubnetIds
+                MaxvCpus: 256
+            State: ENABLED
+            Type: MANAGED
+
+    # IAM role for CloudWatch Event Rule
+    SubmitScheduledBatchJobRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    - Effect: 'Allow'
+                      Principal:
+                          Service:
+                              - 'events.amazonaws.com'
+                      Action:
+                          - 'sts:AssumeRole'
+            Policies:
+                - PolicyName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-submit-batch-policy'
+                  PolicyDocument:
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - batch:SubmitJob
+                            Resource:
+                                [
+                                    !Sub 'arn:aws:batch:${AWS::Region}:${AWS::AccountId}:job-queue/${Organization}-${Product}-${Module}-*-${EnvironmentName}*',
+                                    !Sub 'arn:aws:batch:${AWS::Region}:${AWS::AccountId}:job-definition/${Organization}-${Product}-${Module}-*-${EnvironmentName}*',
+                                ]
+    # Nested stack for pilot scope
+    PilotScopeStack:
+        Type: AWS::CloudFormation::Stack
+        Properties:
+            TemplateURL: !Sub 'https://s3.amazonaws.com/ps-temp-files-us-east-1/${Organization}-${Product}-${Module}-batchjob.yaml'
+            Parameters:
+                Organization: !Ref Organization
+                Product: !Ref Product
+                Module: !Ref Module
+                Scope: 'pilot'
+                EnvironmentName: !Ref EnvironmentName
+                TargetAWSAccountNumber: !Ref TargetAWSAccountNumber
+                LogRetentionPeriod: !Ref LogRetentionPeriod
+                BatchComputeEnv: !Ref BatchComputeEnv
+                JobTable: !Ref JobTable
+                RenditionTable: !Ref RenditionTable
+                DocumentTable: !Ref DocumentTable
+                VeevaAPIEndpoint: !Ref VeevaAPIEndpoint
+                VeevaUserId: !Ref VeevaUserId
+                VeevaPassword: !Ref VeevaPassword
+                DocumentBucket: !Ref DocumentBucket
+                EcsTaskExecutionRole: !GetAtt EcsTaskExecutionRole.Arn
+                JobStatusNotificationTopic: !Ref JobStatusNotificationTopic
+                JobSummaryNotificationTopic: !Ref JobSummaryNotificationTopic
+                BatchJobRoleArn: !GetAtt BatchJobRole.Arn
+                BatchJobRoleName: !Ref BatchJobRole
+                SubmitScheduledBatchJobRole: !GetAtt SubmitScheduledBatchJobRole.Arn
+                SnsKeyAlias: !Ref SnsCmkKeyAlias
+
+Outputs:
+    DocumentBucketName:
+        Description: Bucket name for extracted documents
+        Value: !Ref DocumentBucket

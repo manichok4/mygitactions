@@ -1,0 +1,808 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+    This template deploys core resources for Widen upload job.
+
+Metadata:
+    AWS::CloudFormation::Interface:
+        ParameterGroups:
+            - Label:
+                  default: OPMC details
+              Parameters:
+                  - Organization
+                  - Product
+                  - Module
+            - Label:
+                  default: Widen connection
+              Parameters:
+                  - WidenAPIEndpoint
+                  - WidenUploadProfileName
+                  - WidenAPIKey
+            - Label:
+                  default: Key Administrator
+              Parameters:
+                  - KeyAdministratorRoleName
+            - Label:
+                  default: Deployment environment
+              Parameters:
+                  - EnvironmentName
+            - Label:
+                  default: Cross-account access
+              Parameters:
+                  - SourceAWSAccountNumber
+                  - CrossAccountRoleArn
+                  - DocumentBucketName
+            - Label:
+                  default: CloudWatch Log configuration
+              Parameters:
+                  - LogRetentionPeriod
+            - Label:
+                  default: Network configuration
+              Parameters:
+                  - VpcId
+                  - SubnetIds
+                  - AZaSubnetId
+                  - AZbSubnetId
+
+Parameters:
+    Organization:
+        Type: String
+        Description: Organization name corresponding to the OPMC naming convention
+        Default: alcon
+    Product:
+        Type: String
+        Description: Product name corresponding to the OPMC naming convention
+        Default: amp
+    Module:
+        Type: String
+        Description: Module name corresponding to the OPMC naming convention
+        Default: promomats
+    WidenAPIEndpoint:
+        Type: String
+        Description: Domain and path for Widen API
+        Default: 'api.widencollective.com'
+        MinLength: 1
+    WidenUploadProfileName:
+        Type: String
+        Description: Name of Widen upload profile
+        Default: 'Veeva Upload Test'
+        MinLength: 1
+    WidenAPIKey:
+        Type: String
+        Description: SSM Parameter name that stores API key for Widen API authentication
+        MinLength: 1
+        Default: 'alcon-amp-promomats-api-key'
+    EnvironmentName:
+        Type: String
+        Description: Environment name (up to 4 characters) such as dev, int, stg that will be used for resource name prefix (wherever applicable)
+        Default: dev
+        MinLength: 1
+        MaxLength: 4
+    SourceAWSAccountNumber:
+        Type: String
+        Description: 12-digit AWS account number for source account
+        AllowedPattern: '\d{12}'
+        Default: 945035601941
+    CrossAccountRoleArn:
+        Type: String
+        Description: ARN of IAM role for S3 access in source account
+        MinLength: 1
+    DocumentBucketName:
+        Type: String
+        Description: Name of S3 bucket that contains extracted document in source account
+        MinLength: 1
+    VpcId:
+        Type: AWS::EC2::VPC::Id
+        Description: VPC ID for AWS Batch Compute Environment
+    SubnetIds:
+        Type: List<AWS::EC2::Subnet::Id>
+        Description: List of Subnet IDs for AWS Batch Compute Environment
+    AZaSubnetId:
+        Type: AWS::EC2::Subnet::Id
+        Description: Subnet Id in Availability Zone A for EFS mount target
+    AZbSubnetId:
+        Type: AWS::EC2::Subnet::Id
+        Description: Subnet Id in Availability Zone B for EFS mount target
+    KeyAdministratorRoleName:
+        Type: String
+        Description: IAM role name for KMS key administration
+        MinLength: 1
+        Default: Acct3Admin
+    LogRetentionPeriod:
+        Type: String
+        Description: Retention period (in days) for Batch job CloudWatch Log (Leave blanks to never expire)
+        AllowedValues:
+            - ''
+            - 1
+            - 3
+            - 5
+            - 7
+            - 14
+            - 30
+            - 60
+            - 90
+            - 120
+            - 150
+            - 180
+            - 365
+            - 400
+            - 545
+            - 731
+            - 1827
+            - 3653
+
+Resources:
+    # DynamoDB resources
+    JobTable:
+        Type: AWS::DynamoDB::Table
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W74
+                      reason: |
+                          Using default encryption by DynamoDB
+        Properties:
+            BillingMode: PAY_PER_REQUEST
+            # TableName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-job'
+            AttributeDefinitions:
+                - AttributeName: 'id'
+                  AttributeType: 'S'
+                - AttributeName: 'runDate'
+                  AttributeType: 'S'
+                - AttributeName: 'source'
+                  AttributeType: 'S'
+                - AttributeName: 'scope#RunDate'
+                  AttributeType: 'S'
+            KeySchema:
+                - AttributeName: 'id'
+                  KeyType: 'HASH'
+            PointInTimeRecoverySpecification:
+                PointInTimeRecoveryEnabled: true
+            GlobalSecondaryIndexes:
+                - IndexName: 'byRunDate'
+                  KeySchema:
+                      - AttributeName: 'runDate'
+                        KeyType: 'HASH'
+                  Projection:
+                      ProjectionType: ALL
+                - IndexName: 'bySourceByScopeByRunDate'
+                  KeySchema:
+                      - AttributeName: 'source'
+                        KeyType: 'HASH'
+                      - AttributeName: 'scope#RunDate'
+                        KeyType: 'RANGE'
+                  Projection:
+                      ProjectionType: ALL
+
+    FileUploadTable:
+        Type: AWS::DynamoDB::Table
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W74
+                      reason: |
+                          Using default encryption by DynamoDB
+        Properties:
+            BillingMode: PAY_PER_REQUEST
+            # TableName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-file-upload'
+            AttributeDefinitions:
+                - AttributeName: 'jobID'
+                  AttributeType: 'S'
+                - AttributeName: 'targetFileName'
+                  AttributeType: 'S'
+                - AttributeName: 'documentID#Version#FileType#RenditionType'
+                  AttributeType: 'S'
+                - AttributeName: 'uploadStatus'
+                  AttributeType: 'S'
+            KeySchema:
+                - AttributeName: 'jobID'
+                  KeyType: 'HASH'
+                - AttributeName: 'targetFileName'
+                  KeyType: 'RANGE'
+            PointInTimeRecoverySpecification:
+                PointInTimeRecoveryEnabled: true
+            GlobalSecondaryIndexes:
+                - IndexName: 'byJobIdByDocumentIdByVersionByFileTypeByRenditionType'
+                  KeySchema:
+                      - AttributeName: 'jobID'
+                        KeyType: 'HASH'
+                      - AttributeName: 'documentID#Version#FileType#RenditionType'
+                        KeyType: 'RANGE'
+                  Projection:
+                      ProjectionType: ALL
+                - IndexName: 'byJobIdByUploadStatus'
+                  KeySchema:
+                      - AttributeName: 'jobID'
+                        KeyType: 'HASH'
+                      - AttributeName: 'uploadStatus'
+                        KeyType: 'RANGE'
+                  Projection:
+                      ProjectionType: ALL
+    # SSM parameters
+    WidenUploadProfileParam:
+        Type: AWS::SSM::Parameter
+        Properties:
+            Description: Widen Upload profile
+            Name: !Sub '${Organization}-${Product}-${Module}-widen-upload-profile'
+            Type: String
+            Value: !Ref WidenUploadProfileName
+    # SQS key resources
+    SqsCmkKey:
+        Type: AWS::KMS::Key
+        Properties:
+            Description: !Sub 'SQS Queue Encryption Key for ${Organization}-${Product}-${Module}-${EnvironmentName}'
+            EnableKeyRotation: true
+            KeyPolicy:
+                Version: 2012-10-17
+                Id: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-key-policy'
+                Statement:
+                    - Sid: 'Enable IAM User Permissions'
+                      Effect: Allow
+                      Principal:
+                          AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+                      Action: 'kms:*'
+                      Resource: '*'
+                    - Sid: 'Allow access for Key Administrators'
+                      Effect: Allow
+                      Principal:
+                          AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${KeyAdministratorRoleName}'
+                      Action:
+                          - 'kms:Create*'
+                          - 'kms:Describe*'
+                          - 'kms:Enable*'
+                          - 'kms:List*'
+                          - 'kms:Put*'
+                          - 'kms:Update*'
+                          - 'kms:Revoke*'
+                          - 'kms:Disable*'
+                          - 'kms:Get*'
+                          - 'kms:Delete*'
+                          - 'kms:TagResource'
+                          - 'kms:UntagResource'
+                          - 'kms:ScheduleKeyDeletion'
+                          - 'kms:CancelKeyDeletion'
+                      Resource: '*'
+                    - Sid: 'Allow Amazon SNS to use this key'
+                      Effect: Allow
+                      Principal:
+                          Service: 'sns.amazonaws.com'
+                      Action:
+                          - 'kms:Decrypt'
+                          - 'kms:GenerateDataKey'
+                      Resource: '*'
+                    - Sid: 'Allow Batch Job to use this key'
+                      Effect: Allow
+                      Principal:
+                          AWS: !GetAtt BatchJobRole.Arn
+                      Action:
+                          - 'kms:Decrypt'
+                          - 'kms:GenerateDataKey'
+                      Resource: '*'
+    SqsCmkKeyAlias:
+        Type: AWS::KMS::Alias
+        Properties:
+            AliasName: !Sub 'alias/${Organization}-${Product}-${Module}-${EnvironmentName}-sqs-key'
+            TargetKeyId: !GetAtt SqsCmkKey.Arn
+    # SNS and related resources
+    SnsCmkKey:
+        Type: AWS::KMS::Key
+        Properties:
+            Description: !Sub 'SNS Topic Encryption Key for ${Organization}-${Product}-${Module}-${EnvironmentName}'
+            EnableKeyRotation: true
+            KeyPolicy:
+                Version: 2012-10-17
+                Id: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-key-policy'
+                Statement:
+                    - Sid: 'Enable IAM User Permissions'
+                      Effect: Allow
+                      Principal:
+                          AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+                      Action: 'kms:*'
+                      Resource: '*'
+                    - Sid: 'Allow access for Key Administrators'
+                      Effect: Allow
+                      Principal:
+                          AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${KeyAdministratorRoleName}'
+                      Action:
+                          - 'kms:Create*'
+                          - 'kms:Describe*'
+                          - 'kms:Enable*'
+                          - 'kms:List*'
+                          - 'kms:Put*'
+                          - 'kms:Update*'
+                          - 'kms:Revoke*'
+                          - 'kms:Disable*'
+                          - 'kms:Get*'
+                          - 'kms:Delete*'
+                          - 'kms:TagResource'
+                          - 'kms:UntagResource'
+                          - 'kms:ScheduleKeyDeletion'
+                          - 'kms:CancelKeyDeletion'
+                      Resource: '*'
+                    - Sid: 'Allow Amazon SNS to use this key'
+                      Effect: Allow
+                      Principal:
+                          Service: 'sns.amazonaws.com'
+                      Action:
+                          - 'kms:Decrypt'
+                          - 'kms:GenerateDataKey'
+                      Resource: '*'
+                    - Sid: 'Allow Batch Job to use this key'
+                      Effect: Allow
+                      Principal:
+                          AWS: !GetAtt BatchJobRole.Arn
+                      Action:
+                          - 'kms:Decrypt'
+                          - 'kms:GenerateDataKey'
+                      Resource: '*'
+    SnsCmkKeyAlias:
+        Type: AWS::KMS::Alias
+        Properties:
+            AliasName: !Sub 'alias/${Organization}-${Product}-${Module}-${EnvironmentName}-sns-key'
+            TargetKeyId: !GetAtt SnsCmkKey.Arn
+    JobStatusNotificationTopic:
+        Type: AWS::SNS::Topic
+        Properties:
+            TopicName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-job-status'
+            DisplayName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-job-status'
+            KmsMasterKeyId: !Ref SnsCmkKeyAlias
+    JobSummaryNotificationTopic:
+        Type: AWS::SNS::Topic
+        Properties:
+            TopicName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-job-summary'
+            DisplayName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-job-summary'
+            KmsMasterKeyId: !Ref SnsCmkKeyAlias
+
+    # IAM resources
+    EcsTaskExecutionRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    - Effect: 'Allow'
+                      Principal:
+                          Service:
+                              - 'ecs-tasks.amazonaws.com'
+                      Action:
+                          - 'sts:AssumeRole'
+            ManagedPolicyArns:
+                - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+    BatchJobRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W76
+                      reason: Suppress SPCM score higher than 25 as these are permissions required for batch job
+                    - id: W11
+                      reason: |
+                          batch:ListJobs and batch:DescribeJobs requires '*' as resource
+                          https://docs.aws.amazon.com/service-authorization/latest/reference/list_awsbatch.html.
+                          Key policy to allow SNS publish with CMK uses '*' as resource
+                          https://aws.amazon.com/blogs/compute/encrypting-messages-published-to-amazon-sns-with-aws-kms/
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    - Effect: 'Allow'
+                      Principal:
+                          Service:
+                              - 'ecs-tasks.amazonaws.com'
+                      Action:
+                          - 'sts:AssumeRole'
+            Policies:
+                - PolicyName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-batch-task-policy'
+                  PolicyDocument:
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - batch:DescribeJobs
+                                - batch:ListJobs
+                            Resource: '*'
+                          - Effect: Allow
+                            Action:
+                                - sns:Publish
+                            Resource: !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${Organization}-${Product}-${Module}-${EnvironmentName}-job-summary'
+                          - Effect: Allow
+                            Action:
+                                - s3:GetObject
+                                - s3:GetObjectVersionAcl
+                                - s3:GetObjectVersion
+                                - dynamodb:PutItem
+                                - dynamodb:GetItem
+                                - dynamodb:Query
+                                - sts:AssumeRole
+                            Resource:
+                                - !Sub 'arn:aws:s3:::${DocumentBucketName}/*'
+                                - !GetAtt JobTable.Arn
+                                - !GetAtt FileUploadTable.Arn
+                                - !Ref CrossAccountRoleArn
+
+                          - Effect: Allow
+                            Action:
+                                - s3:ListBucket
+                                - dynamodb:Query
+                            Resource:
+                                - 'arn:aws:s3:::*'
+                                - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${JobTable}/index/*'
+                                - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${FileUploadTable}/index/*'
+
+                          - Effect: Allow
+                            Action:
+                                - ssm:GetParameter
+                            Resource:
+                                - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${Organization}-${Product}-${Module}*'
+                          - Effect: Allow
+                            Action:
+                                - 'kms:Decrypt'
+                                - 'kms:GenerateDataKey'
+                            Resource: '*'
+                            Condition:
+                                ForAnyValue:StringEquals:
+                                    kms:ResourceAliases:
+                                        - !Sub 'alias/${Organization}-${Product}-${Module}-${EnvironmentName}-sqs-key'
+                                        - !Sub 'alias/${Organization}-${Product}-${Module}-${EnvironmentName}-sns-key'
+    # EFS resource
+    EfsSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W5
+                      reason: |
+                          Allow outbound egress rule to 0.0.0.0/0
+                    - id: W40
+                      reason: |
+                          Allow outbound egress rule to all protocols
+        Properties:
+            GroupDescription: !Sub 'Security group for accessing ${Organization}-${Product}-${Module}-${EnvironmentName} EFS'
+            VpcId: !Ref VpcId
+            SecurityGroupIngress:
+                - IpProtocol: tcp
+                  FromPort: 2049
+                  ToPort: 2049
+                  SourceSecurityGroupId: !Ref BatchComputeSecurityGroup
+                  Description: 'Allow batch compute environment to access EFS on TCP-2049'
+            SecurityGroupEgress:
+                - IpProtocol: -1
+                  CidrIp: '0.0.0.0/0'
+                  FromPort: -1
+                  ToPort: -1
+                  Description: 'Allow outbound traffic'
+            Tags:
+                - Key: Name
+                  Value: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-efs-access'
+    EfsFileSystem:
+        Type: AWS::EFS::FileSystem
+        Properties:
+            Encrypted: true
+            FileSystemTags:
+                - Key: Name
+                  Value: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-widen-files'
+    EfsMountTargetAZa:
+        Type: AWS::EFS::MountTarget
+        Properties:
+            FileSystemId: !Ref EfsFileSystem
+            SecurityGroups:
+                - !GetAtt EfsSecurityGroup.GroupId
+            SubnetId: !Ref AZaSubnetId
+
+    EfsMountTargetAZb:
+        Type: AWS::EFS::MountTarget
+        Properties:
+            FileSystemId: !Ref EfsFileSystem
+            SecurityGroups:
+                - !GetAtt EfsSecurityGroup.GroupId
+            SubnetId: !Ref AZbSubnetId
+
+    # CodeBuild resource to create folder in EFS
+    EFSCodeBuildRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W11
+                      reason: |
+                          Policy uses '*' for resources per
+                          https://docs.aws.amazon.com/codebuild/latest/userguide/auth-and-access-control-iam-identity-based-access-control.html#customer-managed-policies-example-create-vpc-network-interface
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service:
+                              - codebuild.amazonaws.com
+                      Action:
+                          - sts:AssumeRole
+            Path: /
+            Policies:
+                - PolicyName: EFSCodeBuildServicePolicy
+                  PolicyDocument:
+                      Version: 2012-10-17
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - ec2:CreateNetworkInterface
+                                - ec2:DescribeDhcpOptions
+                                - ec2:DescribeNetworkInterfaces
+                                - ec2:DeleteNetworkInterface
+                                - ec2:DescribeSubnets
+                                - ec2:DescribeSecurityGroups
+                                - ec2:DescribeVpcs
+                            Resource: '*'
+                          - Effect: Allow
+                            Action:
+                                - ec2:CreateNetworkInterfacePermission
+                            Resource: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*'
+                            Condition:
+                                StringEquals:
+                                    ec2:AuthorizedService: 'codebuild.amazonaws.com'
+                                ArnEquals:
+                                    ec2:Subnet:
+                                        - !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${AZaSubnetId}'
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogGroup
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource:
+                                - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${Organization}-${Product}-${Module}-${EnvironmentName}-efs-mount'
+                                - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${Organization}-${Product}-${Module}-${EnvironmentName}-efs-mount:*'
+    EfsCodeBuildSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W5
+                      reason: |
+                          Allow outbound egress rule to 0.0.0.0/0
+                    - id: W40
+                      reason: |
+                          Allow outbound egress rule to all protocols
+                    - id: W42
+                      reason: |
+                          Allow ingress rule to all protocols from itself
+        Properties:
+            GroupDescription: !Sub 'Security group for ${Organization}-${Product}-${Module}-${EnvironmentName} EFS CodeBuild project'
+            VpcId: !Ref VpcId
+            SecurityGroupEgress:
+                - IpProtocol: -1
+                  CidrIp: '0.0.0.0/0'
+                  FromPort: -1
+                  ToPort: -1
+                  Description: 'allow all outbound traffic'
+            Tags:
+                - Key: Name
+                  Value: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-efs-codebuild'
+    EfsCodeBuildIngressRule:
+        Type: AWS::EC2::SecurityGroupIngress
+        Properties:
+            GroupId: !Ref EfsSecurityGroup
+            IpProtocol: tcp
+            FromPort: 2049
+            ToPort: 2049
+            SourceSecurityGroupId: !Ref EfsCodeBuildSecurityGroup
+            Description: 'Allow TCP-2049 traffic to EFS'
+
+    EfsCodeBuildSecurityGroupIngressRule:
+        Type: AWS::EC2::SecurityGroupIngress
+        Properties:
+            GroupId: !Ref EfsCodeBuildSecurityGroup
+            IpProtocol: -1
+            FromPort: -1
+            ToPort: -1
+            SourceSecurityGroupId: !Ref EfsCodeBuildSecurityGroup
+            Description: 'Allow inbound traffic from itself'
+    EFSCodeBuild:
+        Type: AWS::CodeBuild::Project
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W32
+                      reason: |
+                          Using default managed CMK for Amazon Simple Storage Service (Amazon S3).
+        Properties:
+            Artifacts:
+                Type: NO_ARTIFACTS
+            VpcConfig:
+                VpcId: !Ref VpcId
+                Subnets:
+                    - !Ref AZaSubnetId
+                SecurityGroupIds:
+                    - !Ref EfsCodeBuildSecurityGroup
+            Environment:
+                ComputeType: BUILD_GENERAL1_SMALL
+                Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+                PrivilegedMode: true
+                Type: LINUX_CONTAINER
+                ImagePullCredentialsType: CODEBUILD
+                EnvironmentVariables:
+                    - Name: FILE_SYSTEM_ID
+                      Value: !Ref EfsFileSystem
+            Name: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-efs-mount'
+            ServiceRole: !GetAtt EFSCodeBuildRole.Arn
+            Source:
+                Type: NO_SOURCE
+                BuildSpec: |
+                    version: 0.2
+                    phases:
+                      install:
+                        commands:
+                          - yum install -y amazon-efs-utils
+                      pre_build:
+                        commands:
+                          - groupadd --gid 9001 --system app-user
+                          - useradd --system --uid 9001 --gid 9001  --home /home/app-user --shell /bin/bash app-user
+                      build:
+                        commands:
+                          - sed -i '/#region = us-east-1/s/^#//' /etc/amazon/efs/efs-utils.conf
+                          - mkdir efs
+                          - mount -t efs $FILE_SYSTEM_ID efs/
+                          - cd efs
+                          - mkdir -p app_data
+                          - chown -R app-user:app-user app_data
+
+    CodeBuildStarter:
+        Type: Custom::CodeBuildStarter
+        DependsOn: EfsMountTargetAZa
+        Properties:
+            ServiceToken: !GetAtt CodeBuildStarterLambda.Arn
+            ProjectName: !Ref EFSCodeBuild
+    CodeBuildStarterLambdaRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    - Effect: 'Allow'
+                      Principal:
+                          Service:
+                              - 'lambda.amazonaws.com'
+                      Action:
+                          - 'sts:AssumeRole'
+            Policies:
+                - PolicyName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-efs-mount-policy'
+                  PolicyDocument:
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - codebuild:StartBuild
+                            Resource: !Sub 'arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/${Organization}-${Product}-${Module}-${EnvironmentName}-efs-mount'
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogGroup
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource:
+                                - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+                                - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${Organization}-${Product}-${Module}-${EnvironmentName}-efs-processor'
+                                - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${Organization}-${Product}-${Module}-${EnvironmentName}-efs-processor:*'
+
+    CodeBuildStarterLambda:
+        Type: AWS::Lambda::Function
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: |
+                          Lambda function to start EFSCodeBuild project during provisioning only
+                    - id: W92
+                      reason: |
+                          Lambda function to start EFSCodeBuild project during provisioning only
+        Properties:
+            FunctionName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-efs-processor'
+            Role: !GetAtt CodeBuildStarterLambdaRole.Arn
+            Runtime: python3.9
+            Handler: index.handler
+            Timeout: 300
+            Code:
+                ZipFile: |
+                    import json
+                    import cfnresponse
+                    import boto3
+                    import re
+
+                    codebuild_client = boto3.client('codebuild')
+
+                    def handler(event, context):
+                        try:
+                            if event['RequestType'] == 'Create':
+                                print(f'Create-{event["ResourceProperties"]["ProjectName"]}')
+                                codebuild_client.start_build(projectName=event["ResourceProperties"]["ProjectName"])
+
+                                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                            elif event['RequestType'] == 'Update':
+                                print(f'Update-{event["ResourceProperties"]["ProjectName"]}')
+                                codebuild_client.start_build(projectName=event["ResourceProperties"]["ProjectName"])
+
+                                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                            elif event['RequestType'] == 'Delete':
+                                print(f'Delete-{event["ResourceProperties"]["ProjectName"]}')
+                                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                        except Exception as e:
+                            print(f'Exception {e} is caught')
+                            cfnresponse.send(event, context, cfnresponse.FAILED, {})
+    # AWS Batch resources
+    BatchComputeSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W42
+                      reason: |
+                          Allow all traffic from itself
+                    - id: W5
+                      reason: |
+                          Allow outbound egress rule to 0.0.0.0/0
+                    - id: W40
+                      reason: |
+                          Allow outbound egress rule for all protocols
+        Properties:
+            GroupDescription: !Sub 'Security group for ${Organization}-${Product}-${Module}-${EnvironmentName} Batch Compute Environment'
+            VpcId: !Ref VpcId
+            SecurityGroupEgress:
+                - IpProtocol: -1
+                  CidrIp: '0.0.0.0/0'
+                  FromPort: -1
+                  ToPort: -1
+                  Description: 'allow all outbound traffic'
+            Tags:
+                - Key: Name
+                  Value: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-security-group'
+    BatchComputeSecurityGroupIngressRule:
+        Type: AWS::EC2::SecurityGroupIngress
+        Properties:
+            GroupId: !Ref BatchComputeSecurityGroup
+            IpProtocol: -1
+            FromPort: -1
+            ToPort: -1
+            SourceSecurityGroupId: !Ref BatchComputeSecurityGroup
+            Description: 'Allow all inbound traffic from itself'
+
+    BatchComputeEnv:
+        Type: AWS::Batch::ComputeEnvironment
+        Properties:
+            ComputeEnvironmentName: !Sub '${Organization}-${Product}-${Module}-${EnvironmentName}-compute-env'
+            ComputeResources:
+                Type: FARGATE
+                SecurityGroupIds:
+                    - !Ref BatchComputeSecurityGroup
+                Subnets: !Ref SubnetIds
+                MaxvCpus: 256
+            State: ENABLED
+            Type: MANAGED
+    # Nested stack for pilot scope
+    PilotScopeStack:
+        Type: AWS::CloudFormation::Stack
+        Properties:
+            TemplateURL: !Sub 'https://s3.amazonaws.com/sbx-amp-cloudformation/${Organization}-${Product}-${Module}-batchjob.yaml'
+            Parameters:
+                Organization: !Ref Organization
+                Product: !Ref Product
+                Module: !Ref Module
+                WidenAPIEndpoint: !Ref WidenAPIEndpoint
+                WidenAPIKey: !Ref WidenAPIKey
+                EnvironmentName: !Ref EnvironmentName
+                SourceAWSAccountNumber: !Ref SourceAWSAccountNumber
+                CrossAccountRoleArn: !Ref CrossAccountRoleArn
+                WidenUploadProfileParam: !Ref WidenUploadProfileParam
+                LogRetentionPeriod: !Ref LogRetentionPeriod
+                BatchComputeEnv: !Ref BatchComputeEnv
+                JobTable: !Ref JobTable
+                FileUploadTable: !Ref FileUploadTable
+                DocumentBucketName: !Ref DocumentBucketName
+                EcsTaskExecutionRole: !GetAtt EcsTaskExecutionRole.Arn
+                BatchJobRoleArn: !GetAtt BatchJobRole.Arn
+                BatchJobRoleName: !Ref BatchJobRole
+                JobSummaryNotificationTopic: !Ref JobSummaryNotificationTopic
+                JobStatusNotificationTopic: !Ref JobStatusNotificationTopic
+                EfsFileSystem: !Ref EfsFileSystem
+                SqsKeyAlias: !Ref SqsCmkKeyAlias
+                Scope: 'pilot'
+
+Outputs:
+    FileSystemId:
+        Description: EFS File System Id
+        Value: !Ref EfsFileSystem
